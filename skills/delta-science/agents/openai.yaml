@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delta Science"
+  short_description: "Access and orchestrate all Science tools through Delta CLI"
+  default_prompt: "Use $delta-science to analyse the research goal, choose the right tools, and complete the task through Delta CLI."

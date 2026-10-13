@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delta CLI Shared Rules"
+  short_description: "Handle Delta CLI configuration, authentication, errors and security boundaries"
+  default_prompt: "Use $delta-shared to check and resolve Delta CLI configuration or authentication issues."

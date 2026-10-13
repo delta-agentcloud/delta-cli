@@ -1,0 +1,683 @@
+#!/usr/bin/env node
+// Copyright (c) 2026 Delta Agent Cloud Authors
+// SPDX-License-Identifier: MIT
+
+const fs = require("fs");
+const path = require("path");
+const { execFileSync, execFile } = require("child_process");
+const p = require("@clack/prompts");
+
+const PKG = "@delta-agentcloud/cli";
+const SKILLS_REPO = "delta-agentcloud/delta-cli";
+const NPM_REGISTRIES = ["https://registry.npmjs.org"];
+const GH_MIRRORS = [];
+const CONFIG_DIR = path.join(osHomedir(), ".delta-infra");
+const CONFIG_VERSION = 1;
+const DEFAULT_BASE_URL = "https://delta-infra-nacos.laddery.uk";
+const isWindows = process.platform === "win32";
+
+const PLATFORM_PATHS = {
+  agents:   [".agents", "skills"],
+  claude:   [".claude", "skills"],
+  opencode: [".config", "opencode", "skills"],
+  cursor:   [".cursor", "skills"],
+  mementos: ["memento_s", "skills"],
+};
+
+const PLATFORM_LABELS = {
+  zh: {
+    agents:   "通用 Agent 目录 (~/.agents/skills) — Codex / Cursor / OpenCode",
+    claude:   "Claude Code (~/.claude/skills)",
+    opencode: "OpenCode 原生目录 (~/.config/opencode/skills)",
+    cursor:   "Cursor (~/.cursor/skills)",
+    mementos: "Memento-S 开发模式 (~/memento_s/skills)",
+  },
+  en: {
+    agents:   "Generic agent dir (~/.agents/skills) — Codex / Cursor / OpenCode",
+    claude:   "Claude Code (~/.claude/skills)",
+    opencode: "OpenCode native dir (~/.config/opencode/skills)",
+    cursor:   "Cursor (~/.cursor/skills)",
+    mementos: "Memento-S dev mode (~/memento_s/skills)",
+  },
+};
+
+const skillManifest = require("../skills/manifest.json");
+const SKILL_NAMES = skillManifest.skills;
+const RETIRED_SKILL_NAMES = skillManifest.retired_skills || [];
+
+// Language for interactive prompts and log text. Detection precedence:
+//   DELTA_CLI_LANG (explicit override) > OS locale env (LANG/LC_ALL/LANGUAGE/
+//   LC_MESSAGES) > platform probe (Windows UI culture via PowerShell) >
+//   Intl default locale. Only zh and en are supported; anything not Chinese
+//   falls back to English. Neutral locales (C / POSIX / und) carry no language
+//   signal and resolve to English instead of leaking the runtime's default.
+//
+// Windows does not set the POSIX LANG/LC_ALL vars and Node's Intl defaults to
+// en-US there, so a Chinese Windows user would otherwise see English. We probe
+// the real UI culture on that platform instead.
+function detectLang() {
+  if (process.env.DELTA_CLI_LANG) {
+    return process.env.DELTA_CLI_LANG.toLowerCase().startsWith("zh") ? "zh" : "en";
+  }
+  const neutral = /^(c|posix|und)(\b|$)/i;
+  const candidates = [
+    process.env.LC_ALL,
+    process.env.LC_MESSAGES,
+    process.env.LANG,
+    process.env.LANGUAGE,
+  ];
+  let sawLocale = false;
+  for (const value of candidates) {
+    if (!value) continue;
+    sawLocale = true;
+    const lower = value.toLowerCase();
+    if (neutral.test(value)) return "en";
+    if (lower.startsWith("zh")) return "zh";
+    return "en";
+  }
+  if (sawLocale) return "en";
+  if (isWindows) {
+    const win = windowsUiLanguage();
+    if (win) return win;
+  }
+  try {
+    if (String(Intl.DateTimeFormat().resolvedOptions().locale).toLowerCase().startsWith("zh")) {
+      return "zh";
+    }
+  } catch {}
+  return "en";
+}
+
+// Returns "zh" or "en" from the Windows UI culture, or "" when it cannot be read.
+function windowsUiLanguage() {
+  try {
+    const out = execFileSync(
+      "powershell.exe",
+      ["-NoProfile", "-Command",
+        "[System.Globalization.CultureInfo]::CurrentUICulture.Name"],
+      { stdio: ["ignore", "pipe", "ignore"], encoding: "utf8", timeout: 8000 }
+    );
+    const name = (out || "").trim().toLowerCase();
+    if (name.startsWith("zh")) return "zh";
+    if (name) return "en";
+  } catch {}
+  return "";
+}
+
+const LANG = detectLang();
+
+function platformSkillDir(platform) {
+  return path.join(osHomedir(), ...PLATFORM_PATHS[platform]);
+}
+
+// ── i18n ────────────────────────────────────────────────────────────────────
+
+const messages = {
+  zh: {
+    setup:          "正在设置 Delta Agent Cloud CLI...",
+    upgrade:        "正在升级 %s (v%s → v%s)...",
+    step1:          "正在安装 %s...",
+    step1Skip:      "已安装 (v%s)，跳过",
+    step1Done:      "已全局安装",
+    step1Upgraded:  "已升级到 v%s",
+    step1Fail:      "全局安装失败。运行以下命令重试: npm install -g %s",
+    step2:          "安装 AI Skills",
+    step2SelectPlatforms: "选择需要安装 Delta Skills 的 AI 工具平台（可多选）",
+    step2Spinner:   "正在安装 Skills...",
+    step2Done:      "Skills 已安装",
+    step2DoneFor:   "已安装至: %s",
+    step2Skip:      "已安装，跳过",
+    step2Fail:      "Skills 安装失败。运行以下命令重试: npx skills add %s -y -g",
+    step3:          "正在初始化配置...",
+    step3Done:      "配置已初始化 (Server: %s)",
+    step3Fail:      "配置初始化失败。运行以下命令重试: delta-cli config init",
+    step4:          "身份认证",
+    step4Confirm:   "是否进行身份认证？",
+    step4GuideTitle:"还未配置 API Key",
+    step4Guide:     "请先在网页端生成一个 API Key：\n  %s\n打开后复制生成的 Key，粘贴到下方提示处。",
+    step4Skip:      "跳过身份认证。后续运行 delta-cli auth login 完成",
+    step4Done:      "认证完成",
+    step4Fail:      "认证失败。运行以下命令重试: delta-cli auth login",
+    done:           "安装完成！\n现在可以让你的 AI 工具使用 delta-cli 管理 Delta Sandbox 资源或调用 Science 工具。",
+    cancelled:      "安装已取消",
+    nonTtyHint:     "要完成配置，请在终端中运行：\n  delta-cli auth login\n若还没有 API Key，请先在网页端生成：\n  %s",
+    uninstallConfirm: "将移除全局包、AI Skills 和配置文件。是否继续？",
+    uninstallCancelled: "卸载已取消",
+    uninstallDone:  "卸载完成",
+    uninstallComplete: "卸载完成。",
+  },
+  en: {
+    setup:          "Setting up Delta Agent Cloud CLI...",
+    upgrade:        "Upgrading %s (v%s → v%s)...",
+    step1:          "Installing %s globally...",
+    step1Skip:      "Already installed (v%s). Skipped",
+    step1Done:      "Installed globally",
+    step1Upgraded:  "Upgraded to v%s",
+    step1Fail:      "Failed to install globally. Run manually: npm install -g %s",
+    step2:          "Install AI skills",
+    step2SelectPlatforms: "Select AI tool platforms to install Delta Skills (multi-select)",
+    step2Spinner:   "Installing skills...",
+    step2Done:      "Skills installed",
+    step2DoneFor:   "Installed to: %s",
+    step2Skip:      "Already installed. Skipped",
+    step2Fail:      "Failed to install skills. Run manually: npx skills add %s -y -g",
+    step3:          "Initializing config...",
+    step3Done:      "Config initialized (Server: %s)",
+    step3Fail:      "Failed to init config. Run manually: delta-cli config init",
+    step4:          "Authorization",
+    step4Confirm:   "Would you like to authenticate now?",
+    step4GuideTitle:"No API key configured yet",
+    step4Guide:     "Please generate an API key on the web dashboard first:\n  %s\nCopy the key and paste it when prompted.",
+    step4Skip:      "Skipped. Run delta-cli auth login to authorize later",
+    step4Done:      "Authorization complete",
+    step4Fail:      "Failed to authorize. Run delta-cli auth login to retry",
+    done:           "You are all set!\nYour AI tool can now use delta-cli to manage Delta Sandbox resources or invoke Science tools.",
+    cancelled:      "Installation cancelled",
+    nonTtyHint:     "To complete setup, run interactively:\n  delta-cli auth login\nIf you don't have an API key yet, generate one first:\n  %s",
+    uninstallConfirm: "This will remove the global package, AI Skills and config. Continue?",
+    uninstallCancelled: "Uninstall cancelled",
+    uninstallDone:  "Uninstall complete",
+    uninstallComplete: "Uninstall complete.",
+  },
+};
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function handleCancel(value, msg) {
+  if (p.isCancel(value)) {
+    p.cancel(msg.cancelled);
+    process.exit(0);
+  }
+  return value;
+}
+
+function execCmd(cmd, args, opts) {
+  if (isWindows) {
+    return execFileSync("cmd.exe", ["/c", cmd, ...args], opts);
+  }
+  return execFileSync(cmd, args, opts);
+}
+
+function run(cmd, args, opts = {}) {
+  execCmd(cmd, args, { stdio: "inherit", ...opts });
+}
+
+function runSilent(cmd, args, opts = {}) {
+  return execCmd(cmd, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    ...opts,
+  });
+}
+
+function runSilentAsync(cmd, args, opts = {}) {
+  const actualCmd = isWindows ? "cmd.exe" : cmd;
+  const actualArgs = isWindows ? ["/c", cmd, ...args] : args;
+  return new Promise((resolve, reject) => {
+    execFile(actualCmd, actualArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+      ...opts,
+    }, (err, stdout, stderr) => {
+      if (err) {
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+      }
+      else resolve(stdout);
+    });
+  });
+}
+
+function fmt(template, ...values) {
+  let i = 0;
+  return template.replace(/%s/g, () => values[i++] ?? "");
+}
+
+const OVERSEAS_DASHBOARD = "https://delta-infra-dashboard.laddery.uk/dashboard/api-keys";
+
+function dashboardAPIKeysUrl() {
+  return OVERSEAS_DASHBOARD;
+}
+
+function formatExecErr(err) {
+  if (!err) return "";
+  if (err.stderr) return err.stderr.toString().trim();
+  if (err.stdout) return err.stdout.toString().trim();
+  return err.message ? err.message.trim() : String(err);
+}
+
+function osHomedir() {
+  return process.env.HOME ||
+    process.env.USERPROFILE ||
+    (process.env.HOMEDRIVE && process.env.HOMEPATH && process.env.HOMEDRIVE + process.env.HOMEPATH) ||
+    "/root";
+}
+
+function isInteractiveEnv() {
+  return !!process.stdin.isTTY &&
+    !!process.stdout.isTTY &&
+    !process.env.CI &&
+    !process.env.NO_COLOR &&
+    process.env.TERM !== "dumb";
+}
+
+function createSpinner() {
+  if (isInteractiveEnv()) return p.spinner();
+  return {
+    start: (msg) => { if (msg) console.log(msg); },
+    stop: (msg) => { if (msg) console.log(msg); },
+  };
+}
+
+function whichDeltaCli() {
+  try {
+    const prefix = execFileSync("npm", ["prefix", "-g"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    }).toString().trim();
+    const bin = isWindows
+      ? path.join(prefix, "delta-cli.cmd")
+      : path.join(prefix, "bin", "delta-cli");
+    if (fs.existsSync(bin)) return bin;
+  } catch {}
+  try {
+    const cmd = isWindows ? "where" : "which";
+    return execFileSync(cmd, ["delta-cli"], { stdio: ["ignore", "pipe", "pipe"] })
+      .toString().split("\n")[0].trim();
+  } catch {
+    return null;
+  }
+}
+
+function getLatestVersion() {
+  try {
+    const out = runSilent("npm", ["view", PKG, "version"], { timeout: 15000 });
+    const ver = out.toString().trim();
+    return /^\d+\.\d+\.\d+/.test(ver) ? ver : null;
+  } catch { return null; }
+}
+
+function semverLessThan(a, b) {
+  const pa = a.replace(/-.*$/, "").split(".").map(Number);
+  const pb = b.replace(/-.*$/, "").split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) < (pb[i] || 0)) return true;
+    if ((pa[i] || 0) > (pb[i] || 0)) return false;
+  }
+  return false;
+}
+
+function getGloballyInstalledVersion() {
+  try {
+    const out = runSilent("npm", ["list", "-g", PKG], { timeout: 15000 });
+    const match = out.toString().match(/@(\d+\.\d+\.\d+[^\s]*)/);
+    return match ? match[1] : "unknown";
+  } catch { return null; }
+}
+
+function getExistingConfig() {
+  try {
+    const configPath = path.join(CONFIG_DIR, "config.json");
+    if (!fs.existsSync(configPath)) return null;
+    return JSON.parse(fs.readFileSync(configPath, "utf8"));
+  } catch { return null; }
+}
+
+function writeConfig({ baseUrl, existing = null } = {}) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  const config = {
+    version: CONFIG_VERSION,
+    base_url: baseUrl || DEFAULT_BASE_URL,
+  };
+  if (existing && existing.token) {
+    config.token = existing.token;
+  }
+  fs.writeFileSync(path.join(CONFIG_DIR, "config.json"), JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+}
+
+// ── Steps ───────────────────────────────────────────────────────────────────
+
+async function stepInstallGlobally(msg) {
+  const installedVer = getGloballyInstalledVersion();
+  const latestVer = getLatestVersion();
+  const needsUpgrade = installedVer && latestVer && semverLessThan(installedVer, latestVer);
+
+  if (installedVer && !needsUpgrade) {
+    p.log.info(fmt(msg.step1Skip, installedVer));
+    return false;
+  }
+
+  const targetVer = latestVer || installedVer;
+  const s = createSpinner();
+  if (needsUpgrade) {
+    s.start(fmt(msg.upgrade, PKG, installedVer, latestVer));
+  } else {
+    s.start(fmt(msg.step1, PKG));
+  }
+  let lastInstallErr = null;
+  try {
+    let installed = false;
+    for (const registry of NPM_REGISTRIES) {
+      try {
+        await runSilentAsync("npm", ["install", "-g", PKG, "--registry", registry], {
+          timeout: 300000,
+          env: { ...process.env, DELTA_CLI_MIRROR: GH_MIRRORS[0] },
+        });
+        installed = true;
+        break;
+      } catch (e) {
+        lastInstallErr = e;
+        const reason = formatExecErr(e).slice(0, 400);
+        if (reason) p.log.error(`npm registry ${registry} install failed: ${reason}`);
+      }
+    }
+    if (!installed) throw lastInstallErr || new Error("all npm registries failed");
+
+    if (targetVer) {
+      for (const mirror of GH_MIRRORS) {
+        try {
+          await runSilentAsync(process.execPath, [
+            path.join(__dirname, "install.js"),
+          ], {
+            timeout: 300000,
+            env: { ...process.env, DELTA_CLI_RUN: "true", DELTA_CLI_VERSION: targetVer, DELTA_CLI_MIRROR: mirror },
+          });
+          break;
+        } catch { }
+      }
+    }
+    s.stop(needsUpgrade ? fmt(msg.step1Upgraded, latestVer) : msg.step1Done);
+    return needsUpgrade;
+  } catch (e) {
+    s.stop(fmt(msg.step1Fail, PKG));
+    const reason = formatExecErr(e).slice(0, 1200);
+    if (reason) p.log.error(`Failed reason:\n${reason}`);
+    process.exit(1);
+  }
+}
+
+function findPackageSkillsDir() {
+  const candidates = [];
+  try {
+    const npmRoot = runSilent("npm", ["root", "-g"], { timeout: 10000 })
+      .toString().trim();
+    candidates.push(path.join(npmRoot, PKG, "skills"));
+  } catch {}
+  candidates.push(path.join(__dirname, "..", "skills"));
+
+  for (const c of candidates) {
+    if (fs.existsSync(path.join(c, "delta-sandbox", "SKILL.md"))) {
+      return c;
+    }
+  }
+  return null;
+}
+
+function installSkillsFromLocalPackage(platforms) {
+  const pkgSkillsDir = findPackageSkillsDir();
+  if (!pkgSkillsDir) return false;
+
+  for (const platform of platforms) {
+    const targetDir = platformSkillDir(platform);
+    fs.mkdirSync(targetDir, { recursive: true });
+    for (const skill of RETIRED_SKILL_NAMES) {
+      try { fs.rmSync(path.join(targetDir, skill), { recursive: true, force: true }); } catch {}
+    }
+    for (const skill of SKILL_NAMES) {
+      const src = path.join(pkgSkillsDir, skill);
+      if (!fs.existsSync(src)) continue;
+      const dst = path.join(targetDir, skill);
+      try { fs.rmSync(dst, { recursive: true, force: true }); } catch {}
+      fs.cpSync(src, dst, { recursive: true });
+    }
+  }
+  return true;
+}
+
+async function stepSelectPlatforms(msg) {
+  if (!isInteractiveEnv()) {
+    return ["agents"];
+  }
+  const labels = PLATFORM_LABELS[LANG];
+  const defaultPlatforms = fs.existsSync(path.dirname(platformSkillDir("claude")))
+    ? ["agents", "claude", "mementos"]
+    : ["agents", "mementos"];
+  const selected = await p.multiselect({
+    message: msg.step2SelectPlatforms,
+    options: Object.keys(PLATFORM_PATHS).map((key) => ({
+      value: key,
+      label: labels[key],
+    })),
+    initialValues: defaultPlatforms,
+    required: true,
+  });
+  handleCancel(selected, msg);
+  return selected;
+}
+
+async function stepInstallSkills(msg, platforms) {
+  const s = createSpinner();
+  s.start(msg.step2Spinner);
+  try {
+    try {
+      if (installSkillsFromLocalPackage(platforms)) {
+        s.stop(msg.step2Done);
+        p.log.info(fmt(msg.step2DoneFor, platforms.join(", ")));
+        return;
+      }
+    } catch { }
+
+    if (!platforms.includes("agents")) {
+      throw new Error("local skills package not found and agent dir not selected");
+    }
+
+    const urls = [
+      `https://github.com/${SKILLS_REPO}`,
+    ];
+    let lastErr;
+    for (const url of urls) {
+      try {
+        s.start(`${msg.step2Spinner} (try ${url.split("/")[2]})`);
+        await runSilentAsync("npx", ["-y", "skills", "add", url, "-y", "-g"], {
+          timeout: 15000,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        });
+        s.stop(msg.step2Done);
+        p.log.info(fmt(msg.step2DoneFor, "agents"));
+        return;
+      } catch (e) {
+        lastErr = e;
+        if (e && e.stderr) console.error(`[skills mirror failed] ${url}: ${e.stderr.toString().trim().slice(0, 200)}`);
+        else if (e && e.message) console.error(`[skills mirror failed] ${url}: ${e.message}`);
+      }
+    }
+    throw lastErr;
+  } catch {
+    s.stop(fmt(msg.step2Fail, SKILLS_REPO));
+    process.exit(1);
+  }
+}
+
+async function stepConfigInit(msg) {
+  const s = createSpinner();
+  s.start(msg.step3);
+
+  const existingConfig = getExistingConfig();
+  // The server address needs no manual entry: reuse the existing value when present, otherwise the built-in default.
+  const baseUrl = (existingConfig && existingConfig.base_url) || DEFAULT_BASE_URL;
+
+  s.stop(msg.step3);
+
+  try {
+    writeConfig({ baseUrl, existing: existingConfig });
+    p.log.success(fmt(msg.step3Done, baseUrl));
+  } catch (e) {
+    p.log.error(e.message || String(e));
+    p.log.error(msg.step3Fail);
+    process.exit(1);
+  }
+}
+
+async function stepAuthLogin(msg) {
+  const deltaCli = whichDeltaCli();
+  if (!deltaCli) {
+    p.log.warn("delta-cli not found, skipping authorization");
+    return;
+  }
+
+  const yes = await p.confirm({
+    message: msg.step4Confirm,
+  });
+  if (p.isCancel(yes)) {
+    p.cancel(msg.cancelled);
+    process.exit(0);
+  }
+  if (!yes) {
+    p.log.info(msg.step4Skip);
+    return;
+  }
+
+  p.log.step(msg.step4);
+  p.log.warn(msg.step4GuideTitle);
+  const existing = getExistingConfig();
+  p.log.info(fmt(msg.step4Guide, dashboardAPIKeysUrl()));
+  try {
+    run(deltaCli, ["auth", "login"]);
+    p.log.success(msg.step4Done);
+  } catch {
+    p.log.warn(msg.step4Fail);
+  }
+}
+
+// ── Uninstall steps ─────────────────────────────────────────────────────────
+
+async function stepUninstallSkills(msg) {
+  const s = createSpinner();
+  s.start("Removing AI skills...");
+
+  let removedLocally = false;
+  for (const platform of Object.keys(PLATFORM_PATHS)) {
+    const dir = platformSkillDir(platform);
+    for (const skill of [...SKILL_NAMES, ...RETIRED_SKILL_NAMES]) {
+      try {
+        fs.rmSync(path.join(dir, skill), { recursive: true, force: true });
+        removedLocally = true;
+      } catch { }
+    }
+  }
+
+  if (removedLocally) {
+    s.stop("AI skills removed");
+    return;
+  }
+
+  try {
+    await runSilentAsync(
+      "npx",
+      ["-y", "skills", "remove", ...SKILL_NAMES, ...RETIRED_SKILL_NAMES, "-g"],
+      {
+      timeout: 60000,
+      },
+    );
+    s.stop("AI skills removed");
+  } catch {
+    s.stop("Warning: skill removal failed. You can retry:");
+    p.log.info(`  npx skills remove ${[...SKILL_NAMES, ...RETIRED_SKILL_NAMES].join(" ")} -g`);
+  }
+}
+
+function stepRemoveConfig() {
+  if (!fs.existsSync(CONFIG_DIR)) {
+    return;
+  }
+  fs.rmSync(CONFIG_DIR, { recursive: true, force: true });
+}
+
+async function stepUninstallPackage(msg) {
+  const installedVer = getGloballyInstalledVersion();
+  if (!installedVer) {
+    return;
+  }
+  const s = createSpinner();
+  s.start("Removing global package...");
+  try {
+    await runSilentAsync("npm", ["uninstall", "-g", PKG], { timeout: 60000 });
+    s.stop("Package removed");
+  } catch {
+    s.stop("Failed to remove global package");
+    p.log.info(`  npm uninstall -g ${PKG}`);
+  }
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+async function doInstall() {
+  const isInteractive = isInteractiveEnv();
+  const msg = messages[LANG];
+
+  if (isInteractive) {
+    p.intro(msg.setup);
+    await stepInstallGlobally(msg);
+    const platforms = await stepSelectPlatforms(msg);
+    await stepInstallSkills(msg, platforms);
+    await stepConfigInit(msg);
+    await stepAuthLogin(msg);
+    p.outro(msg.done);
+  } else {
+    console.log(msg.setup);
+    await stepInstallGlobally(msg);
+    const platforms = ["agents"];
+    await stepInstallSkills(msg, platforms);
+    const existing = getExistingConfig();
+    // Non-interactive install also presets the default server address, so no manual config init is needed afterwards.
+    try {
+      writeConfig({
+        baseUrl: (existing && existing.base_url) || DEFAULT_BASE_URL,
+        existing,
+      });
+    } catch (e) {
+      p.log.error(e.message || String(e));
+    }
+    console.log(fmt(msg.nonTtyHint, dashboardAPIKeysUrl()));
+  }
+}
+
+async function doUninstall() {
+  const isInteractive = isInteractiveEnv();
+  const msg = messages[LANG];
+
+  if (isInteractive) {
+    const ok = await p.confirm({
+      message: msg.uninstallConfirm,
+    });
+    if (p.isCancel(ok) || !ok) {
+      p.cancel(msg.uninstallCancelled);
+      process.exit(0);
+    }
+  }
+
+  await stepRemoveConfig();
+  await stepUninstallSkills();
+  await stepUninstallPackage();
+
+  if (isInteractive) {
+    p.outro(msg.uninstallDone);
+  } else {
+    console.log("\n" + msg.uninstallComplete);
+  }
+}
+
+function main() {
+  const subcommand = process.argv[2];
+  if (subcommand === "uninstall") {
+    doUninstall().catch((e) => {
+      console.error("[delta-cli] Uninstall failed:", e.message);
+      process.exit(1);
+    });
+  } else {
+    doInstall().catch((e) => {
+      console.error("[delta-cli] Install failed:", e.message);
+      process.exit(1);
+    });
+  }
+}
+
+main();

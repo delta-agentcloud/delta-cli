@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delta Sandbox workstation"
+  short_description: "Safely create, run and destroy isolated compute workstations using Delta CLI"
+  default_prompt: "Use $delta-sandbox to complete this computation in an isolated workstation and return the result."

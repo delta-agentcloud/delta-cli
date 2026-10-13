@@ -1,0 +1,20 @@
+{
+  "skills": [
+    "delta-sandbox",
+    "delta-shared",
+    "delta-science",
+    "delta-protein"
+  ],
+  "retired_skills": [
+    "pubchem",
+    "rdkit",
+    "pymatgen",
+    "gsasii",
+    "lammps",
+    "delta-bo",
+    "ldm-bo",
+    "synbo-service",
+    "antbo-service",
+    "antbo-ldm-guard"
+  ]
+}
