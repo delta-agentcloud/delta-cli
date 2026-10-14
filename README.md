@@ -2,19 +2,6 @@
 
 Command-line tool for the Delta Agent Cloud, used to manage Delta Sandbox GPU/CPU compute workloads and invoke Science tools.
 
-## v1.1.19 Release Notes
-
-- `feat(config)`: `delta-cli config init` and the install wizard now write a default `base_url` automatically, removing the manual first-use configuration step.
-- Added the `delta-protein` skill: 40+ protein structure prediction/design/analysis tool references and cross-tool workflows.
-- Updated the `xrd` science reference (cloud XRD phase identification, artifacts, CIF simulation and refinement contract).
-- Internal: public repository sync and release pipeline improvements (sync planner and unit tests).
-
-## v1.1.18 Release Notes
-
-- Translate the three active agent skills (`delta-shared`, `delta-sandbox`, and `delta-science`) and their maintained references into English.
-- Validate representative agent workflows for authentication-state reporting, sandbox resource discovery, live Science catalogue discovery, and safe handling of tools without a request schema.
-- Include all three skill directories in the source release commit and regenerate platform binary checksums as part of the release.
-
 ## Installation
 
 ### Option 1: npx one-click install (recommended)
