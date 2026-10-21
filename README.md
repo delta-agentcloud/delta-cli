@@ -244,6 +244,8 @@ delta-cli sandbox kill <sandbox_id>
 
 > **Tip**: `sandbox list` (list sandbox instances) differs from `sandbox ls <id>` (list a directory); don't confuse them.
 
+> **Paths inside the sandbox**: a path that points *inside* the sandbox (`--path`, the remote part of `write-multiple --entry`, `upload --target`, `pull --source`, `run`/`run-bg --log-file`) is prefixed with the sandbox working directory when it is relative, and absolute paths are used as-is; paths that point at the *local* machine (`write --source`, `upload --source`, `pull --target`, `read --output`) are local and are never rewritten.
+
 | Command | Description |
 |---------|-------------|
 | `delta-cli sandbox list` | List the current user's sandbox instances |
@@ -317,8 +319,10 @@ All commands return a unified JSON envelope:
 {"ok":true,"data":{"id":"sb-xxx","status":"running"}}
 
 // error
-{"ok":false,"error":{"type":"auth","message":"not authenticated","hint":"run 'delta-cli auth login'"}}
+{"ok":false,"error":{"type":"auth","message":"not authenticated","hint":"run 'delta-cli auth login'","request_id":"create_a1b2c3"}}
 ```
+
+`error.hint` gives the actionable next step (for a failed create it names the concrete cause - for example, the image was not cached on the target node, so retry or pick a GPU type whose node already has the image), and `error.request_id` identifies the same failure in the server log.
 
 Error types and exit codes:
 
