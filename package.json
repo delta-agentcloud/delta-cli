@@ -1,6 +1,6 @@
 {
   "name": "@delta-agentcloud/cli",
-  "version": "1.1.24",
+  "version": "1.1.28",
   "description": "Delta Agent Cloud CLI for sandbox compute and science tools.",
   "bin": {
     "delta-cli": "scripts/run.js"

@@ -120,12 +120,6 @@ Common environment variables:
 | `DELTA_CLI_FATAL_ON_ERROR` | Exit non-zero on install failure (default: warn only; useful for debugging). |
 | `DELTA_CLI_DOWNLOAD_TIMEOUT` | Max wait time per download source (ms, default 120000). |
 
-### Option 5: Go Install
-
-```bash
-go install github.com/delta-infra/delta-infra-cli/cmd/delta-cli@latest
-```
-
 ## Quick Start
 
 ### 1. Initialize configuration
@@ -178,6 +172,14 @@ You can also provide credentials via environment variables: `DELTA_INFRA_API_KEY
 
 ```bash
 # Create a sandbox with a GPU (--max-life defaults to 30 minutes; raise it for long tasks)
+# ⚠️ Lifecycle timing (see skills/delta-sandbox/references/lifecycle.md):
+#   - Private compute (OpenSandbox): the clock starts when the create request is accepted, and the
+#     image pull / readiness time counts towards max-life; the platform reclaims the sandbox at expiry.
+#   - Third-party compute (AutoDL/RunPod): the clock starts when the sandbox is ready (started_at),
+#     and the server-side cleanup reclaims it at max-life plus up to 10 minutes of grace.
+#   - Auto-reclaim (including an early platform reclaim) does NOT write back to OSS; pull the
+#     artifacts or call `sandbox finish` explicitly if you need to keep them. `sandbox status`
+#     returns expires_at / reclaim_source / termination_reason, and a finished sandbox stays queryable.
 # ⚠️ Resource semantics: `--memory` is the container CPU memory TOTAL (one per sandbox); `--gpu-mem` is the memory PER CARD (MiB) —
 # `--gpu 2 --gpu-mem 8000` = 8000MiB per card, 16000MiB total (the private OpenSandbox/HAMi backend writes it straight to the HAMi per-card annotation;
 # the cloud RunPod backend treats --gpu-mem as total memory ÷ card count). Per-card memory limit is visible via `sandbox resources` (memory_mib).
@@ -187,19 +189,20 @@ You can also provide credentials via environment variables: `DELTA_INFRA_API_KEY
 # `--devices` requests host devices (comma-separated, e.g. kvm → /dev/kvm inside the container, for nested virtualization): a privilege escalation,
 # rejected by the server when the allowlist is disabled (never silently ignored). Both apply to private compute only; third-party compute ignores them.
 delta-cli sandbox create \
-  --image image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
+  --image-name image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
   --cpu 4 --memory 16Gi --gpu 1 \
   --max-life 120
 
 # For DataLoader multiprocessing / nested virtualization: raise /dev/shm and request /dev/kvm (shm must not exceed memory)
 delta-cli sandbox create \
-  --image image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
+  --image-name image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
   --cpu 4 --memory 8Gi --shm-size 4Gi --devices kvm \
   --max-life 120
 
-# Sandbox that must live long and not be auto-cleaned: add --no-auto-cleanup (only explicit kill/finish destroys it)
+# Sandbox that must live long and not be auto-cleaned: add --no-auto-cleanup
+# (it disables both the platform TTL and the server-side cleanup; only explicit kill/finish destroys it)
 delta-cli sandbox create \
-  --image image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
+  --image-name image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
   --cpu 4 --memory 16Gi --gpu 1 \
   --no-auto-cleanup
 
@@ -208,15 +211,29 @@ delta-cli sandbox run <sandbox_id> \
   --command "<command>" \
   --timeout 3600
 
-# v1.0.85+ sandbox run uses an SSE real-time stream: stdout carries raw data: frames (no trailing envelope); exit_code/log_file are in the complete frame
-# To get the trailing JSON summary in stdout: read the log_file and parse it (sandbox read <id> --path <log_file>)
+# v1.0.85+ sandbox run uses an SSE real-time stream: stdout carries raw data: frames (no trailing envelope);
+# exit_code / log_file / stdout_tail / duration_seconds are in the complete frame
 delta-cli sandbox run <sandbox_id> --command "echo '{\"status\":\"ok\",\"result\":\"done\"}'" --timeout 60
+
+# Automation/orchestration: --format json (same as --json-result) prints exactly ONE JSON envelope,
+# whose data holds execution_id / finished / exit_code / stdout_tail / stderr_tail /
+# stdout_size / stderr_size / log_file / duration_seconds / result_summary.
+# The field names match the complete frame; on failure it is still a single object:
+# {"ok":false,"error":{...},"data":{...}} and the process exits non-zero.
+delta-cli sandbox run <sandbox_id> --command "python run.py" --timeout 600 --format json
+
+# Background task + wait + unified result
+delta-cli sandbox run-bg <sandbox_id> --command "python train.py" --timeout 3600 --wait --format json
 
 # Read a result file
 delta-cli sandbox read <sandbox_id> --path /workspace/result.json
 
-# Destroy the sandbox
+# Destroy the sandbox (the destroy keeps running server-side; the response carries request_id)
 delta-cli sandbox kill <sandbox_id>
+
+# Idempotent create retries + reconciliation afterwards
+delta-cli sandbox create --image-name <image name> --idempotency-key retry-001
+delta-cli sandbox operation <request_id>
 ```
 
 ## Command list
@@ -253,19 +270,20 @@ delta-cli sandbox kill <sandbox_id>
 | `delta-cli sandbox resources [--provider opensandbox\|autodl]` | Show remaining requestable resources (GPU/memory/cores) per backend |
 | `delta-cli sandbox images` | Show the available image list (each entry has `image_name`/`tags`/`description`/`supports_shared_workspace`; `supports_shared_workspace=true` means the compute supports a shared workspace (opensandbox/autodl) and can pair with `--shared-workspace`; the actual seed/write-back is decided at create time by probing for rclone inside the image) |
 | `delta-cli sandbox recommend --cpu N --memory XGi` | Get a resource configuration recommendation |
-| `delta-cli sandbox create --image <img> [--shm-size XGi] [--devices kvm] [--no-auto-cleanup] [--shared-workspace=true\|false]` | Create a sandbox container (`--no-auto-cleanup` disables auto-cleanup; `--shared-workspace` defaults to true: enables the shared workspace (seed/write-back determined at create time by probing for rclone in the image; skipped when absent, data not persistent across sandboxes); false skips seed/write-back, suited to fast tasks; `--shm-size` raises /dev/shm (default 64Mi, **must carry a Gi/Mi unit** and be ≤ `--memory`, common for PyTorch DataLoader/multiprocessing); `--devices` is a comma-separated list of host device tokens (`kvm` → /dev/kvm, nested virtualization), **a privilege escalation** the server **explicitly rejects** when the allowlist is off; `--shm-size`/`--devices` apply to private compute only, third-party compute ignores them) |
-| `delta-cli sandbox extend <id> --max-life N` | **Dynamically extend** a running sandbox's max-life (increase or decrease; N must exceed elapsed minutes and be ≤10080; use `kill`/`finish` for early reclaim); without `--max-life` it queries the current lifecycle (elapsed/remaining/expiry); `status` output includes a `data.lifecycle` summary (elapsed/remaining/expiry; omitted when the lifecycle API is unavailable) |
+| `delta-cli sandbox create --image-name <image name> [--idempotency-key <key>] [--shm-size XGi] [--devices kvm] [--no-auto-cleanup] [--shared-workspace=true\|false]` | Create a sandbox container (`--image` is the legacy alias; **`--idempotency-key`**: retrying with the same key replays the original sandbox instead of creating a second one, and a different request under the same key is rejected; the response carries `request_id`/`operation_status`/`replayed`; `--no-auto-cleanup` disables both the platform TTL and the server-side cleanup, so only an explicit kill/finish destroys it; `--shared-workspace` defaults to true: enables the shared workspace (seed/write-back determined at create time by probing for rclone in the image; skipped when absent, data not persistent across sandboxes); false skips seed/write-back, suited to fast tasks; `--shm-size` raises /dev/shm (default 64Mi, **must carry a Gi/Mi unit** and be ≤ `--memory`, common for PyTorch DataLoader/multiprocessing); `--devices` is a comma-separated list of host device tokens (`kvm` → /dev/kvm, nested virtualization), **a privilege escalation** the server **explicitly rejects** when the allowlist is off; `--shm-size`/`--devices` apply to private compute only, third-party compute ignores them) |
+| `delta-cli sandbox extend <id> --max-life N` | **Dynamically extend** a running sandbox's max-life (N must be greater than the current expiry and ≤10080; shortening is not accepted — use `kill`/`finish` for an early reclaim); without `--max-life` it queries the current lifecycle (elapsed/remaining/expiry); `status` output includes a `data.lifecycle` summary (elapsed/remaining/expiry; omitted when the lifecycle API is unavailable) |
 | `delta-cli sandbox connect <id>` | Connect to a sandbox |
-| `delta-cli sandbox status <id>` | Show sandbox status |
-| `delta-cli sandbox finish <id>` | Save results and destroy |
-| `delta-cli sandbox kill <id>` | Destroy a sandbox |
-| `delta-cli sandbox run <id> --command "..." [--timeout <sec>] [--summary/--no-summary] [--artifacts]` | Run a command synchronously (raw SSE `data:` frames to stdout, no trailing envelope; `exit_code`/`log_file` in the `complete` frame); `--summary`/`--artifacts` only apply on the legacy-server fallback path |
-| `delta-cli sandbox run-bg <id> --command "..." [--timeout <sec>] [--wait] [--summary/--no-summary] [--artifacts]` | Run a command in the background; without `--wait` it returns `{execution_id, sandbox_id}` immediately; with `--wait` it follows via SSE (raw `data:` frames to stdout, no trailing envelope) |
+| `delta-cli sandbox status <id>` | Show sandbox status; returns `expires_at` / `reclaim_source`, and a finished sandbox stays queryable with `termination_reason` / `termination_remark` / `terminated_at` (e.g. `max_life_exceeded` / `platform_gone` / `user_killed` / `user_finished`) |
+| `delta-cli sandbox finish <id> [--no-wait]` | Save results and destroy; the destroy is a **server-side task** and the response carries `request_id`/`operation_status` (`--no-wait` returns `pending` immediately and the task continues after a disconnect — reconcile it with `sandbox operation <request_id>`) |
+| `delta-cli sandbox kill <id> [--no-wait]` | Destroy a sandbox (without saving results); the response carries `request_id`/`operation_status`, so after an interrupted call or a network error the real terminal state can be queried with `sandbox operation` |
+| `delta-cli sandbox operation [request_id] [--sandbox-id <id>] [--operation create\|destroy] [--limit N]` | Query the server-side operation ledger: with a `request_id` it fetches that single operation, otherwise it lists the recent create/destroy records (terminal state, time, reason) for billing and resource reconciliation |
+| `delta-cli sandbox run <id> --command "..." [--timeout <sec>] [--format sse\|json] [--json-result] [--summary/--no-summary] [--artifacts]` | Run a command synchronously. By default (`--format sse`) the raw SSE `data:` frames are passed through to stdout with no trailing envelope, and `exit_code`/`log_file`/`stdout_tail`/`duration_seconds` are in the `complete` frame; `--format json` (or `--json-result`) prints exactly **one** JSON envelope whose `data` holds `execution_id`/`finished`/`exit_code`/`stdout_tail`/`stderr_tail`/`stdout_size`/`stderr_size`/`log_file`/`duration_seconds`/`result_summary`, and on failure it is `{ok:false,error,data}` with a non-zero process exit code; `--summary`/`--artifacts` only apply on the legacy-server fallback path. **Exit-code semantics**: a non-zero command exit → `error.type=command_failed`, process exit code **8**; the command finished but its **exit status is unknown** (the stream ended before the `complete` frame, or only an error frame arrived) → `error.type=unknown_execution_state`, process exit code 1 — the CLI **never synthesizes a success** |
+| `delta-cli sandbox run-bg <id> --command "..." [--timeout <sec>] [--wait] [--cancel-on-timeout] [--format sse\|json] [--json-result] [--summary/--no-summary] [--artifacts]` | Run a command in the background; without `--wait` it returns `{execution_id, sandbox_id}` immediately (with `--format json`, the unified result object with `finished=false`); with `--wait` it follows via SSE (raw `data:` frames to stdout, no trailing envelope); `--format json` prints exactly one envelope with the same structure as `sandbox run --format json`. **On a wait timeout** → `error.type=timeout` and a **non-zero** process exit code, with `error.details` keeping `sandbox_id`/`execution_id`/`remote_state` (`not_cancelled`/`cancelled`/`cancel_failed`) so the command can be queried or cancelled afterwards; `remote_state=not_cancelled` means only the local wait stopped and **the remote command may still be running**. The remote command is left running by default — add `--cancel-on-timeout` to cancel it (a failed cancel is reported as `cancel_failed`) |
 | `delta-cli sandbox logs <id> --execution-id <eid> [--tail N --grep <pattern> --context N --max-bytes N]` | Show background logs; returns `stderr_size + stderr_tail` by default (avoids context blow-up); filter with `--tail/--grep` |
 | `delta-cli sandbox cancel <id> --execution-id <eid>` | Interrupt a background command |
-| `delta-cli sandbox read <id> --path <path> [--output <local path>] [--tail N] [--grep <pattern>] [--offset N] [--limit N] [--context N] [--max-bytes N] [--parse-json]` | Read a file in the container; `--output <path>` saves locally; filter with `--tail/--grep`; non-UTF-8 files fall back to base64 automatically |
-| `delta-cli sandbox pull <id> --source <sandbox path> --target <local path> [--recursive] [--pattern <glob>]` | Pull files/dirs from the sandbox to local (mirror of `upload`; flag direction reversed: source=remote, target=local); single file or recursive dir; bidirectional sha1 integrity check on both CLI and server |
-| `delta-cli sandbox write <id> --path <path> --source <local path>` | Write a file |
+| `delta-cli sandbox read <id> --path <path> [--output <local path>] [--tail N] [--grep <pattern>] [--offset N] [--limit N] [--context N] [--max-bytes N] [--parse-json]` | Read a file in the container; `--output <path>` saves locally; filter with `--tail/--grep`. **A full copy (without `--tail/--grep/--offset/--limit/--max-bytes`) is byte-exact**: it goes through the chunked download path (binary-safe, sha256-verified — the envelope reports `byte_exact:true`, `integrity:"sha256"`, `digest_verified`); with any range filter it falls back to the text channel, where the server decodes as UTF-8 and replaces invalid bytes with U+FFFD, so the envelope then reports `byte_exact:false` / `integrity:"text_decoded"` and a warning is printed to stderr — **use `sandbox pull` to copy a binary file**. When the result is printed inline and the file is not valid UTF-8, `content` is the lossy text and the **exact original bytes** are in `content_base64` (base64-decode it); the envelope is marked `byte_exact:true`. Text files carry no `content_base64` |
+| `delta-cli sandbox pull <id> --source <sandbox path> --target <local path> [--pattern <glob>] [--concurrency N] [--no-resume] [--no-verify]` | Pull files/dirs from the sandbox to local (mirror of `upload`; flag direction reversed: source=remote, target=local). **Directories are always pulled recursively** (`--recursive` is deprecated and no longer needed); the transfer uses the **chunked download** path: binary-safe, end-to-end **sha256** verified (`digest_verified`), **resumable** (a partial `<target>.delta.part` is reused), and **parallel** across files and chunks (`--concurrency`, default 4) — so a large file is not bound by a single command timeout. The server publishes its limits with every response (`limits`): 4 MiB chunks (16 MiB max), 100 GiB max per file, 120 s per chunk, 600 s for the whole-file digest. `--no-resume` ignores a leftover `.delta.part`; `--no-verify` skips the sandbox-side sha256 comparison |
+| `delta-cli sandbox write <id> --path <path> --source <local path>` | Write a file. **Binary-safe**: the content travels as base64 and the CLI declares its `size`/`sha256`, which the server verifies before writing (a mismatch is rejected); the response carries `server_sha256`/`sha256`/`size`/`size_verified`. A `--source` above 32 MiB goes through the streaming upload path instead of being read into memory |
 | `delta-cli sandbox write-multiple <id> --entry <remote path>=<local path>` | Write multiple files |
 | `delta-cli sandbox ls <id> --path <path>` | List a directory |
 | `delta-cli sandbox stat <id> --path <path>` | File metadata |
@@ -392,8 +410,8 @@ make install
 make PREFIX=$HOME/.local install
 
 # Windows source install (pick one)
-# A: install to GOPATH/bin with go install
-go install github.com/delta-infra/delta-infra-cli/cmd/delta-cli@latest
+# A: install to GOPATH/bin with go install, from the repository root
+go install ./cmd/delta-cli
 
 # B: run the PowerShell script from the repo root to build and add to the user PATH
 # .\install-from-source.ps1
