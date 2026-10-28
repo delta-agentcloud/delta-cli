@@ -187,6 +187,9 @@ You can also provide credentials via environment variables: `DELTA_INFRA_API_KEY
 # multiprocessing, Chromium-based kernels etc. fail with "No space left on device"/"Bus error" when shared memory is insufficient; raise it then.
 # The unit is mandatory (4G/512M are normalized to 4Gi/512Mi; a bare number is rejected by the server) and must not exceed --memory.
 # `--devices` requests host devices (comma-separated, e.g. kvm → /dev/kvm inside the container, for nested virtualization): a privilege escalation,
+# `--ready-timeout` caps how long the CREATE step waits for the sandbox to become ready (seconds, default 120, range 10-1800):
+# a cold node fetching a large image layer (e.g. 2.9GB) often takes longer than 60s, so raising it avoids error_code=SandboxReadyTimeout.
+# Applies to private compute only; third-party compute uses its own internal create timeout and ignores it. Distinct from --max-life (post-create TTL).
 # rejected by the server when the allowlist is disabled (never silently ignored). Both apply to private compute only; third-party compute ignores them.
 delta-cli sandbox create \
   --image-name image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
