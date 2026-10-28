@@ -373,7 +373,9 @@ Skill files live under `skills/`:
 - `delta-shared/` — shared global rules (auth, config, error handling)
 - `delta-sandbox/` — Sandbox operation guide (lifecycle, command routing)
 - `delta-science/` — the single Science entry point, with the unified Delta CLI wrapper, cross-tool workflows, and
-  on-demand references for PubChem, RDKit, pymatgen, XRD, GSAS-II, LAMMPS, Delta-BO, LDM-BO, SynBO, AntBO
+  on-demand references for PubChem, RDKit, pymatgen, XRD, GSAS-II, QE, LAMMPS, Delta-BO, LDM-BO, SynBO,
+  AntBO, materials-design, strbo and protein/bioinformatics (`huada_protein_tools`); the protein
+  endpoint contracts live under `skills/delta-science/references/protein/`
 
 Hosts such as Memento only need to select `delta-science`. The Skill selects the tool and
 operation from a natural-language research goal and loads only the reference for the current
