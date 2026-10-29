@@ -355,7 +355,11 @@ Error types and exit codes:
 | not_found | 5 | Resource does not exist |
 | network | 6 | Network error |
 | api | 7 | Server error |
+| command_failed | 8 | Command inside the sandbox exited non-zero |
 | internal | 10 | Client internal error |
+| timeout | 11 | `run-bg --wait` local wait deadline elapsed (the remote command may still be running; see `error.details`) |
+| content_integrity_mismatch / content_size_mismatch | 12 | File-transfer verification failed (sha256 or byte-count mismatch) |
+| unknown_execution_state | 1 | The command finished but its exit status is unknowable (**never treated as success**) |
 
 ## AI Agent Skills
 
