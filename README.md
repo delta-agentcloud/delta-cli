@@ -183,23 +183,13 @@ You can also provide credentials via environment variables: `DELTA_INFRA_API_KEY
 # ⚠️ Resource semantics: `--memory` is the container CPU memory TOTAL (one per sandbox); `--gpu-mem` is the memory PER CARD (MiB) —
 # `--gpu 2 --gpu-mem 8000` = 8000MiB per card, 16000MiB total (the private OpenSandbox/HAMi backend writes it straight to the HAMi per-card annotation;
 # the cloud RunPod backend treats --gpu-mem as total memory ÷ card count). Per-card memory limit is visible via `sandbox resources` (memory_mib).
-# ⚠️ Resource semantics: `--shm-size` is the container /dev/shm size (default only 64Mi). PyTorch DataLoader(num_workers>0)/
-# multiprocessing, Chromium-based kernels etc. fail with "No space left on device"/"Bus error" when shared memory is insufficient; raise it then.
-# The unit is mandatory (4G/512M are normalized to 4Gi/512Mi; a bare number is rejected by the server) and must not exceed --memory.
-# `--devices` requests host devices (comma-separated, e.g. kvm → /dev/kvm inside the container, for nested virtualization): a privilege escalation,
+# Note: the server removed the shmSize / devices resource fields; the CLI's --shm-size / --devices have been removed.
 # `--ready-timeout` caps how long the CREATE step waits for the sandbox to become ready (seconds, default 600, range 10-1800):
 # a cold node fetching a large image layer (e.g. 2.9GB) often takes longer than 60s, so raising it avoids error_code=SandboxReadyTimeout.
 # Applies to all providers (private compute / AutoDL / RunPod). Distinct from --max-life (post-create TTL).
-# rejected by the server when the allowlist is disabled (never silently ignored). Both apply to private compute only; third-party compute ignores them.
 delta-cli sandbox create \
   --image-name image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
   --cpu 4 --memory 16Gi --gpu 1 \
-  --max-life 120
-
-# For DataLoader multiprocessing / nested virtualization: raise /dev/shm and request /dev/kvm (shm must not exceed memory)
-delta-cli sandbox create \
-  --image-name image.yangtzeailab.com/opensandbox/pytorch-cuda13:latest \
-  --cpu 4 --memory 8Gi --shm-size 4Gi --devices kvm \
   --max-life 120
 
 # Sandbox that must live long and not be auto-cleaned: add --no-auto-cleanup
@@ -257,7 +247,9 @@ delta-cli sandbox operation <request_id>
 | `delta-cli upgrade --check` | Check whether an update is available |
 | `delta-cli upgrade --cli-only` | Only upgrade the CLI binary |
 | `delta-cli upgrade --skills-only` | Only upgrade AI Skills |
-| `delta-cli usage` | Show current usage and remaining quota |
+| `delta-cli usage` | Show current user info and remaining credits (credits only, not hardware quota) |
+| `delta-cli quota` | Show account hardware quota: GPU/GPU memory/CPU/memory/concurrency limits, used and remaining, GPU trial duration, and GPU/provider/model/image allowlists (`null` = unlimited, `0` = zero quota) |
+| `delta-cli quota --pool` | Parent account: show the sub-account hardware quota pool (pool, allocated, remaining to allocate); a sub-account receives its inherited effective values |
 | `delta-cli --version` | Show version |
 
 ### Sandbox commands
@@ -273,7 +265,7 @@ delta-cli sandbox operation <request_id>
 | `delta-cli sandbox resources [--provider opensandbox\|autodl]` | Show remaining requestable resources (GPU/memory/cores) per backend |
 | `delta-cli sandbox images` | Show the available image list (each entry has `image_name`/`tags`/`description`/`supports_shared_workspace`; `supports_shared_workspace=true` means the compute supports a shared workspace (opensandbox/autodl) and can pair with `--shared-workspace`; the actual seed/write-back is decided at create time by probing for rclone inside the image) |
 | `delta-cli sandbox recommend --cpu N --memory XGi` | Get a resource configuration recommendation |
-| `delta-cli sandbox create --image-name <image name> [--idempotency-key <key>] [--shm-size XGi] [--devices kvm] [--no-auto-cleanup] [--shared-workspace=true\|false]` | Create a sandbox container (`--image` is the legacy alias; **`--idempotency-key`**: retrying with the same key replays the original sandbox instead of creating a second one, and a different request under the same key is rejected; the response carries `request_id`/`operation_status`/`replayed`; `--no-auto-cleanup` disables both the platform TTL and the server-side cleanup, so only an explicit kill/finish destroys it; `--shared-workspace` defaults to true: enables the shared workspace (seed/write-back determined at create time by probing for rclone in the image; skipped when absent, data not persistent across sandboxes); false skips seed/write-back, suited to fast tasks; `--shm-size` raises /dev/shm (default 64Mi, **must carry a Gi/Mi unit** and be ≤ `--memory`, common for PyTorch DataLoader/multiprocessing); `--devices` is a comma-separated list of host device tokens (`kvm` → /dev/kvm, nested virtualization), **a privilege escalation** the server **explicitly rejects** when the allowlist is off; `--shm-size`/`--devices` apply to private compute only, third-party compute ignores them) |
+| `delta-cli sandbox create --image-name <image name> [--idempotency-key <key>] [--no-auto-cleanup] [--shared-workspace=true\|false]` | Create a sandbox container (`--image` is the legacy alias; **`--idempotency-key`**: retrying with the same key replays the original sandbox instead of creating a second one, and a different request under the same key is rejected; the response carries `request_id`/`operation_status`/`replayed`; `--no-auto-cleanup` disables both the platform TTL and the server-side cleanup, so only an explicit kill/finish destroys it; `--shared-workspace` defaults to true: enables the shared workspace (seed/write-back determined at create time by probing for rclone in the image; skipped when absent, data not persistent across sandboxes); false skips seed/write-back, suited to fast tasks; `--shm-size` / `--devices` were removed together with the server's shmSize/devices fields) |
 | `delta-cli sandbox extend <id> --max-life N` | **Dynamically extend** a running sandbox's max-life (N must be greater than the current expiry and ≤10080; shortening is not accepted — use `kill`/`finish` for an early reclaim); without `--max-life` it queries the current lifecycle (elapsed/remaining/expiry); `status` output includes a `data.lifecycle` summary (elapsed/remaining/expiry; omitted when the lifecycle API is unavailable) |
 | `delta-cli sandbox connect <id>` | Connect to a sandbox |
 | `delta-cli sandbox status <id>` | Show sandbox status; returns `expires_at` / `reclaim_source`, and a finished sandbox stays queryable with `termination_reason` / `termination_remark` / `terminated_at` (e.g. `max_life_exceeded` / `platform_gone` / `user_killed` / `user_finished`) |
